@@ -1,0 +1,4 @@
+pymysql==1.1.0
+akshare==1.10.80
+pandas==2.0.3
+numpy==1.24.3
