@@ -355,4 +355,5 @@ def main():
 if __name__ == "__main__":
     # main()W
     # load_csv_datas("/Users/bytedance/Desktop/stock/trade/TRD_Dalyr1.csv", "trade")
-    load_xlsx_datas("/Users/bytedance/Desktop/stock/shares/CG_Capchg.xlsx", "shares")
+    # load_xlsx_datas("/Users/bytedance/Desktop/stock/shares/CG_Capchg.xlsx", "shares")
+    load_csv_datas("/Users/bytedance/Desktop/stock/cash_flow.csv", "cash_flow")

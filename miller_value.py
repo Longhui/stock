@@ -26,6 +26,8 @@ import pandas as pd
 import numpy as np
 from typing import List
 from config import DB_CONFIG
+# 计算从start_date开始的90天每一天的日期
+from datetime import datetime, timedelta
 
 # 配置日志直接输出到终端
 logging.basicConfig(
@@ -105,7 +107,7 @@ class FinancialDataRepository:
             sql = """
             SELECT * FROM profit 
             WHERE Stkcd = %s 
-            AND Accper < %s 
+            AND Accper <= %s 
             ORDER BY Accper DESC 
             LIMIT %s
             """
@@ -145,7 +147,7 @@ class FinancialDataRepository:
             sql = """
             SELECT * FROM balance 
             WHERE Stkcd = %s 
-            AND Accper < %s 
+            AND Accper <= %s 
             ORDER BY Accper DESC 
             LIMIT %s
             """
@@ -185,7 +187,7 @@ class FinancialDataRepository:
             sql = """
             SELECT * FROM cash_flow 
             WHERE Stkcd = %s 
-            AND Accper < %s 
+            AND Accper <= %s 
             ORDER BY Accper DESC 
             LIMIT %s
             """
@@ -325,9 +327,9 @@ class FinancialDataRepository:
             sql = """
             select 2 * (t3.OpCost / (t1.InventNet + t2.InventNet)) as avg_it
             from
-              (select InventNet,Stkcd from balance b where b.Accper = %s) t1,
+              (select InventNet,Stkcd from balance b where b.Accper = (select Accper from balance where Accper <= %s order by Accper desc limit 1)) t1,
               (select InventNet,Stkcd from balance b where b.Accper < %s order by b.Accper desc limit 1) t2,
-              (select Stkcd,OpCost from profit p where p.Accper = %s) t3
+              (select Stkcd,OpCost from profit p where p.Accper = (select Accper from balance where Accper <= %s order by Accper desc limit 1)) t3
             where t1.Stkcd = t2.Stkcd and t1.Stkcd = t3.Stkcd;
             """
             
@@ -371,7 +373,8 @@ class FinancialDataRepository:
             select  
              avg(t.Clsprc/(b.ParOwnEquity/s.Nshrttl)) as avg_pb
             FROM
-              (select ParOwnEquity,Stkcd FROM balance where Accper = %s) b 
+              (select ParOwnEquity,Stkcd FROM balance where Accper = 
+                (select Accper from balance where Accper <= %s order by Accper desc limit 1)) b
               join LATERAL
               (select Clsprc,Stkcd FROM trade WHERE Trddt <= %s and Stkcd = b.Stkcd order by Trddt desc limit 1) t 
                on b.Stkcd = t.Stkcd
@@ -590,7 +593,7 @@ class FinancialDataRepository:
                     profit = float(profit_result['sumProfit'])
                     pe = pe + (cap / profit)
                 else:
-                    logger.warning(f"未找到股票{stock_code}在{end_date}的股票市值数据")
+                    logger.warning(f"未找到股票{stock_code}在{end_date}五年平均市盈率数据")
                     return float('nan')
             return (pe/5)        
         except Exception as e:
@@ -835,7 +838,7 @@ class MillerValueStrategy:
             return np.nan
         return float(market_cap / fcf_ttm)
 
-    def discounted_10y_fcf(self, fcf_base: float, discount_rate: float, growth_rate: float = 0.0) -> float:
+    def discounted_10y_fcf(self, stock_code: str, end_date: str, discount_rate: float, growth_rate: float = 0.0) -> float:
         """
         计算10年自由现金流折现值
         
@@ -847,13 +850,30 @@ class MillerValueStrategy:
         Returns:
             float: 10年自由现金流折现值，如果折现率无效则返回NaN
         """
-        if discount_rate <= 0:
+        sql = """
+            select 
+                sum((NetOpCF - AssetPurchase) * 
+                    pow((1.0 + %s), year(%s)-year(Accper))/
+                    pow((1.0 + %s), year(%s)-year(Accper))) as free_cash 
+            from cash_flow 
+            where Stkcd=%s and Accper like "%12-31" 
+            order by Accper desc limit 10;
+        """
+        try:
+        # 执行查询
+            self.cursor.execute(sql, (growth_rate, end_date ,discount_rate, end_date, stock_code))
+            result = self.cursor.fetchone()
+
+            # 返回单个浮点数值
+            if result and result['free_cash'] is not None:
+                fcf_10y = float(result['free_cash'])
+                return fcf_10y
+            else:
+                logger.warning(f"未找到{end_date}fcf_10y")
+                return np.nan
+        except Exception as e:
+            logger.error(f"查询{end_date}的roc_avg数据时出错: {e}")
             return np.nan
-        v = 0.0
-        for t in range(1, 11):
-            cf = fcf_base * ((1.0 + growth_rate) ** t)
-            v += cf / ((1.0 + discount_rate) ** t)
-        return float(v)
 
     def evaluate_selection(self, stock_code: str, repo: FinancialDataRepository, end_date: str) -> bool:
         """
@@ -903,7 +923,7 @@ class MillerValueStrategy:
         """
         income = repo.get_profit_quarterly(stock_code, 12, end_date)
         balance = repo.get_balance_quarterly(stock_code, 12, end_date)
-        cash = repo.get_cashflow_quarterly(stock_code, 4, end_date)
+        cash = repo.get_cashflow_quarterly(stock_code, 12, end_date)
         market_cap = repo.get_market_cap(stock_code, end_date)
         shares = repo.get_total_shares(stock_code, end_date)
         price = repo.get_latest_close_price(stock_code, end_date)
@@ -922,17 +942,17 @@ class MillerValueStrategy:
         five_year_avg_pe = repo.get_five_year_avg_pe(stock_code, end_date)
         discount = repo.get_discount_rate()
         # 将字符串转换为数值类型再进行计算
-        cfo_numeric = pd.to_numeric(cfo, errors='coerce')
-        capex_numeric = pd.to_numeric(capex, errors='coerce')
-        fcf_base = self._ttm_sum(cfo_numeric - capex_numeric, 2)
-        dcf_10y = self.discounted_10y_fcf(fcf_base, discount, 0.0)
+        # cfo_numeric = pd.to_numeric(cfo, errors='coerce')
+        # capex_numeric = pd.to_numeric(capex, errors='coerce')
+        # fcf_base = self._ttm_sum(cfo_numeric - capex_numeric, 2)
+        dcf_10y = self.discounted_10y_fcf(stock_code, end_date, discount, 0.0)
         condA = pb_latest < 2.0 * market_pb_avg if market_pb_avg is not None and not np.isnan(pb_latest) else False
         condB = pe_ttm < (1.0 / deposit) if deposit is not None and not np.isnan(pe_ttm) and deposit > 0 else False
         condC = pb_latest < five_year_avg_pe if not np.isnan(pb_latest) and five_year_avg_pe is not None else False
         condD = pfcf_ttm < (1.0 / infl) if infl is not None and not np.isnan(pfcf_ttm) and infl > 0 else False
         condE = (market_cap / dcf_10y) < 1.0 if dcf_10y is not None and not np.isnan(dcf_10y) and dcf_10y > 0 else False
         count = int(condA) + int(condB) + int(condC) + int(condD) + int(condE)
-        return count
+        return count,price
 
 class MillerStrategyRunner:
     """米勒策略执行器类"""
@@ -978,7 +998,46 @@ class MillerStrategyRunner:
         except Exception as e:
             logger.error(f"获取股票代码失败: {e}")
             return []
+
+    def insert_trade_stock(self, stock_code: str, end_date: str, price: str, op:str, score: int) -> bool:
+        """
+        向sel_stock表中写入一行记录
         
+        Args:
+            stock_code: 股票代码
+            end_date: 截止日期（格式：YYYY-MM-DD）
+            
+        Returns:
+            bool: 插入成功返回True，失败返回False
+        """
+        try:
+            with self.repo.connection.cursor() as cursor:
+                # 构建SQL插入语句
+                """
+                create table trade_stocks (
+                    Stkcd varchar(30),
+                    end_date date,
+                    price decimal(10, 2),
+                    op varchar(2),
+                    score varchar(2),
+                    primary key(Stkcd, end_date)
+                );
+                """
+                sql = """
+                INSERT INTO trade_stocks(Stkcd, end_date, price, op, score) 
+                VALUES (%s, %s, %s, %s, %s)
+                """
+                
+                # 执行插入操作
+                cursor.execute(sql, (stock_code, end_date, price, op, score))
+                self.repo.connection.commit()
+                logger.info(f"向trade_stock表插入记录成功：股票代码={stock_code}, 日期={end_date}, 价格={price}, op={op}, score={score}")
+                return True
+        except Exception as e:
+            logger.error(f"向trade_stock表插入记录失败：股票代码={stock_code}, 日期={end_date}, 错误={e}")
+            self.repo.connection.rollback()
+            return False
+                
     def insert_sel_stock(self, stock_code: str, end_date: str) -> bool:
         """
         向sel_stock表中写入一行记录
@@ -989,6 +1048,12 @@ class MillerStrategyRunner:
             
         Returns:
             bool: 插入成功返回True，失败返回False
+        """
+        """
+        CREATE TABLE `sel_stocks` (
+            `Stkcd` varchar(100) NOT NULL COMMENT '证券代码',
+            `end_date` date NOT NULL COMMENT '截止日期'
+        )
         """
         try:
             with self.repo.connection.cursor() as cursor:
@@ -1008,7 +1073,7 @@ class MillerStrategyRunner:
             self.repo.connection.rollback()
             return False
     
-    def sel_for_stock(self, end_date: str) -> dict:
+    def sel_for_stocks(self, end_date: str) -> dict:
         """
         对单个股票执行米勒价值投资策略
         
@@ -1019,8 +1084,9 @@ class MillerStrategyRunner:
             dict: 包含选股评估和买入评估结果的字典
         """
         stock_codes = self.get_stock_codes()
-        for i, stock_code in enumerate(stock_codes, 1):
+        for stock_code in (stock_codes):
             sel = self.strategy.evaluate_selection(stock_code, self.repo, end_date)
+            logger.info(f"股票代码={stock_code}, 截止日期={end_date}, 评估结果={sel}")
             if sel:
                 self.insert_sel_stock(stock_code, end_date)
 
@@ -1035,15 +1101,148 @@ class MillerStrategyRunner:
             dict: 包含选股评估和买入评估结果的字典
         """ 
         stock_codes = self.get_sel_codes(end_date)
-        buy_stokcs = []
         for i, stock_code in enumerate(stock_codes, 1):
-            sel = self.strategy.evaluate_buy(stock_code, self.repo, end_date=end_date)
-            if sel:
-                buy_stokcs.append(stock_code)
+            sel,price = self.strategy.evaluate_buy(stock_code, self.repo, end_date=end_date)
+            logger.info(f"股票代码={stock_code}, 截止日期={end_date}, 评估结果={sel}, 价格={price}")
+            if sel >= 3:
+                self.insert_trade_stock(stock_code, end_date, price, '1', sel)
+            elif sel <= 1:
+                self.insert_trade_stock(stock_code, end_date, price, '0', sel)
+
+    def plot_trade_stocks(self, save_path: str = None):
+        """
+        从trade_stocks表读取数据并绘制图表
+        
+        Args:
+            save_path: 图片保存路径，如果为None则不保存
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from datetime import datetime
+            
+            # 从trade_stocks表读取数据
+            with self.repo.connection.cursor() as cursor:
+                sql = """
+                SELECT Stkcd, end_date, price, op 
+                FROM trade_stocks 
+                ORDER BY Stkcd, end_date
+                """
+                cursor.execute(sql)
+                results = cursor.fetchall()
+            
+            if not results:
+                logger.warning("trade_stocks表中没有数据")
+                return
+            
+            # 按股票代码分组数据
+            stock_data = {}
+            for row in results:
+                stock_code = row['Stkcd']
+                if stock_code not in stock_data:
+                    stock_data[stock_code] = {'dates': [], 'prices': [], 'op_0_dates': [], 'op_0_prices': []}
+                
+                # 转换日期格式
+                date_obj = row['end_date']
+                if isinstance(date_obj, str):
+                    date_obj = datetime.strptime(date_obj, '%Y-%m-%d')
+                
+                price = float(row['price'])
+                op = row['op']
+                
+                stock_data[stock_code]['dates'].append(date_obj)
+                stock_data[stock_code]['prices'].append(price)
+                
+                # 记录op为0的数据点
+                if op == '0':
+                    stock_data[stock_code]['op_0_dates'].append(date_obj)
+                    stock_data[stock_code]['op_0_prices'].append(price)
+            
+            # 创建图表
+            plt.figure(figsize=(12, 8))
+            
+            # 生成不同的颜色
+            colors = plt.cm.Set3(np.linspace(0, 1, len(stock_data)))
+            
+            # 为每个股票绘制数据线
+            for i, (stock_code, data) in enumerate(stock_data.items()):
+                if len(data['dates']) > 1:  # 只有多个数据点才绘制连线
+                    plt.plot(data['dates'], data['prices'], 
+                            label=stock_code, color=colors[i], linewidth=2, marker='o', markersize=4)
+                else:  # 单个数据点只绘制散点
+                    plt.scatter(data['dates'], data['prices'], 
+                               label=stock_code, color=colors[i], s=80)
+                
+                # 标记op为0的数据点
+                if data['op_0_dates']:
+                    plt.scatter(data['op_0_dates'], data['op_0_prices'], 
+                               color='red', s=100, marker='X', zorder=5, 
+                               label=f'{stock_code} (op=0)' if len(data['dates']) <= 1 else None)
+            
+            # 设置图表属性
+            plt.title('Trade Stocks Price Trend', fontsize=16, fontweight='bold')
+            plt.xlabel('Date', fontsize=12)
+            plt.ylabel('Price', fontsize=12)
+            
+            # 格式化x轴日期显示
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.gcf().autofmt_xdate()  # 自动旋转日期标签
+            
+            # 添加图例
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            
+            # 添加网格
+            plt.grid(True, alpha=0.3)
+            
+            # 调整布局
+            plt.tight_layout()
+            
+            # 保存或显示图表
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                logger.info(f"图表已保存到: {save_path}")
+            
+            plt.show()
+            
+        except ImportError:
+            logger.error("matplotlib库未安装，无法绘制图表")
+            print("请安装matplotlib: pip install matplotlib")
+        except Exception as e:
+            logger.error(f"绘制图表失败: {e}")
+            raise
 
 if __name__ == '__main__':
+    
     repo = FinancialDataRepository(DB_CONFIG)
     repo.connect()
     runner = MillerStrategyRunner(repo)
-    # runner.sel_for_stock('2023-12-31') 
-    runner.buy_for_stocks('2023-12-31') 
+    # runner.strategy.evaluate_selection("300529", repo, "2023-12-31")
+    # runner.sel_for_stocks('2024-03-31')
+    
+    dates = ['2023-12-31','2024-03-31','2024-06-30','2024-09-30','2024-12-31','2025-03-31','2025-06-30','2025-09-30']
+
+    for end_date in dates:
+        runner.sel_for_stocks(end_date)
+    '''
+    start_date = '2024-01-01'
+
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    date_list = []
+    
+    for i in range(90):
+        current_date = start_dt + timedelta(days=i)
+        date_list.append(current_date.strftime('%Y-%m-%d'))
+    
+    print(f"从{start_date}开始的90天日期列表:")
+    for i, date in enumerate(date_list, 1):
+        print(f"第{i}天: {date}")
+    
+    # 示例：对每个日期执行策略
+    for end_date in date_list:
+        print(f"\n处理日期: {end_date}")
+        runner.buy_for_stocks(end_date)
+    '''
+    # 绘制trade_stocks数据图表
+    # print("\n开始绘制trade_stocks数据图表...")
+    # runner.plot_trade_stocks(save_path='trade_stocks_chart.png') 
